@@ -21,6 +21,21 @@ K_EVAL = 10
 # single-answer pages that dominate the score. See README for the comparison.
 MAX_SEQ_LENGTH = 256
 
+# Retrieval is a hybrid of dense (MiniLM) and lexical (BM25) scores. BM25 catches
+# the exact numbers / dates / names that dense embeddings blur, which is what
+# lifts the hard multi-fact queries. Final per-query score (both min-max
+# normalized over the corpus) = ALPHA_DENSE*dense + (1-ALPHA_DENSE)*bm25.
+ALPHA_DENSE = 0.6
+# BM25 parameters (textbook defaults — chosen to avoid overfitting the public set).
+BM25_K1 = 1.5
+BM25_B = 0.75
+# Index pruning, to keep the shipped lexical index small and clean:
+#   drop near-stopword terms (document frequency above this fraction of N) and
+#   keep only each term's top-BM25 postings (capping also removes noisy low-weight
+#   matches, which slightly *improved* fusion quality).
+BM25_DF_MAX_RATIO = 0.5
+BM25_POSTINGS_CAP = 200
+
 
 def normalize_page_id(value: Any) -> int:
     """Coerce page_id from JSON (int or numeric string) to int."""

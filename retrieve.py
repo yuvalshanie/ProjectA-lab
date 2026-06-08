@@ -1,62 +1,71 @@
 """Query-time retrieval (the timed stage at grading).
 
-Loads the prebuilt index from ``artifacts/``, embeds the query batch with the
-same model, and runs exact inner-product (cosine, since vectors are normalized)
-search with FAISS. Scores are aggregated to the page level by taking each
-page's best unit, then the top-``K_EVAL`` page_ids are returned per query.
+Hybrid of two signals, each scored over the whole corpus and min-max normalized
+per query, then linearly fused:
+
+    score = ALPHA_DENSE * dense_cosine + (1 - ALPHA_DENSE) * bm25
+
+* dense  — cosine similarity between the query and page embeddings
+           (all-MiniLM-L6-v2, L2-normalized -> inner product). Exact search by a
+           dense matmul; at 27k x 384 this is well under a second, so an ANN
+           index (FAISS) is unnecessary here and we keep exact recall.
+* bm25   — lexical overlap from the prebuilt inverted index (see ``lexical.py``),
+           which captures the exact years / populations / scores / names that
+           dense embeddings blur.
+
+There is one vector per page, so each corpus row maps directly to a page_id and
+no chunk aggregation is needed.
 """
 from __future__ import annotations
 
 from pathlib import Path
 from typing import List, Optional
 
-import faiss
 import numpy as np
 
 from embed import embed_queries
 from index import load_index
-from utils import K_EVAL
+from lexical import LexicalIndex
+from utils import ALPHA_DENSE, K_EVAL
 
-# How many units to pull from FAISS before aggregating to pages. With one unit
-# per page this only needs to exceed K_EVAL; the margin keeps results exact if a
-# multi-unit index is ever used.
-_CANDIDATE_UNITS = 256
+
+def _minmax_rows(scores: np.ndarray) -> np.ndarray:
+    """Min-max normalize each row to [0, 1] (constant rows -> 0)."""
+    lo = scores.min(axis=1, keepdims=True)
+    hi = scores.max(axis=1, keepdims=True)
+    return (scores - lo) / (hi - lo + 1e-9)
 
 
 class Retriever:
-    """Holds the FAISS index and the unit->page_id map (built once)."""
+    """Holds the dense vectors, page_id map, and the BM25 index (built once)."""
 
     def __init__(self, artifacts_dir: Optional[Path] = None) -> None:
         vectors, page_ids = load_index(artifacts_dir)
+        self.vectors = np.ascontiguousarray(vectors, dtype=np.float32)
         self.page_ids = page_ids
-        self.index = faiss.IndexFlatIP(vectors.shape[1])
-        if vectors.shape[0]:
-            self.index.add(np.ascontiguousarray(vectors, dtype=np.float32))
+        self.lexical = LexicalIndex(artifacts_dir)
+        if self.lexical.num_docs != len(page_ids):
+            raise ValueError(
+                "Dense/lexical index mismatch: "
+                f"{len(page_ids)} pages vs {self.lexical.num_docs} lexical docs"
+            )
 
     def search(self, queries: List[str], top_k: int = K_EVAL) -> List[List[int]]:
         if not queries:
             return []
-        query_vectors = embed_queries(queries)
-        n_units = self.index.ntotal
-        if n_units == 0:
+        if self.vectors.shape[0] == 0:
             return [[] for _ in queries]
 
-        n_probe = min(n_units, max(_CANDIDATE_UNITS, top_k * 4))
-        scores, idx = self.index.search(
-            np.ascontiguousarray(query_vectors, dtype=np.float32), n_probe
-        )
+        query_vectors = embed_queries(queries)
+        dense = query_vectors @ self.vectors.T          # (Q, n_pages)
+        bm25 = self.lexical.scores(queries)             # (Q, n_pages)
+        fused = ALPHA_DENSE * _minmax_rows(dense) + (1.0 - ALPHA_DENSE) * _minmax_rows(bm25)
 
         results: List[List[int]] = []
-        for row_idx, row_scores in zip(idx, scores):
-            best_per_page: dict[int, float] = {}
-            for unit, score in zip(row_idx, row_scores):
-                if unit < 0:  # FAISS pads with -1 when fewer than n_probe hits
-                    continue
-                pid = int(self.page_ids[unit])
-                if score > best_per_page.get(pid, -1e30):
-                    best_per_page[pid] = float(score)
-            ranked = sorted(best_per_page, key=best_per_page.get, reverse=True)
-            results.append(ranked[:top_k])
+        for row in fused:
+            top = np.argpartition(-row, min(top_k, row.size - 1))[:top_k]
+            top = top[np.argsort(-row[top])]
+            results.append([int(self.page_ids[i]) for i in top])
         return results
 
 

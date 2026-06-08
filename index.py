@@ -19,6 +19,7 @@ import numpy as np
 
 from chunk import Chunk, chunk_corpus
 from embed import EMBED_DIM, embed_texts
+from lexical import build_lexical
 from utils import (
     ARTIFACTS_DIR,
     EMBEDDING_MODEL_NAME,
@@ -47,6 +48,9 @@ def build_index(
     texts = [c.text for c in chunks]
     vectors = embed_texts(texts)
     page_ids = [c.page_id for c in chunks]
+
+    # Lexical (BM25) index over the same document rows, for hybrid retrieval.
+    build_lexical(texts, artifacts_dir=out_dir)
 
     np.save(out_dir / INDEX_VECTORS_NAME, vectors.astype(np.float32))
     meta = {
