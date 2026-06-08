@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Full corpus is NOT required at grading time (run() loads prebuilt artifacts/,
+# not the raw corpus). Excluded to keep the repo lean and LFS-free.
+# Rebuild locally with: python scripts/build_index.py
+data/Wikipedia Entries/
+
+# Local scratch / assignment handout / submission packaging
+Project A.pdf
+Projet A.pdf
+Repo Link.txt
+*.zip
+
+# OS
+.DS_Store
