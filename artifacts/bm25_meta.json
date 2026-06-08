@@ -1,0 +1,9 @@
+{
+  "num_docs": 27074,
+  "k1": 1.5,
+  "b": 0.75,
+  "df_max_ratio": 0.5,
+  "postings_cap": 200,
+  "vocab_size": 490205,
+  "nnz": 5857571
+}
