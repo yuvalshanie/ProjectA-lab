@@ -14,6 +14,13 @@ ARTIFACTS_DIR = STUDENT_ROOT / "artifacts"
 EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 K_EVAL = 10
 
+# Retrieval-unit token budget for the encoder. We embed one vector per page
+# (the answer pages in this corpus are short). We empirically compared 256 / 384
+# / 512: the model's native 256 scored best on the public queries — a larger
+# window slightly helps the hard multi-fact queries but dilutes the short
+# single-answer pages that dominate the score. See README for the comparison.
+MAX_SEQ_LENGTH = 256
+
 
 def normalize_page_id(value: Any) -> int:
     """Coerce page_id from JSON (int or numeric string) to int."""
