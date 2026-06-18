@@ -1,3 +1,16 @@
-numpy>=1.24
-sentence-transformers>=2.2.0
+# Grading runs on the course VM: Tesla M60 GPU, driver 535 / CUDA 12.2.
+# The DEFAULT latest torch pulls a CUDA-13 build that the M60 driver cannot use,
+# so torch.cuda.is_available() returns False -> CPU fallback -> run() exceeds the
+# 60s limit -> score 0. Per the course forum, pin a CUDA-12.1 torch build and
+# sentence-transformers 3.1.1 (newer ST requires a torch too new for the M60).
+
+# VERIFY ON THE ACTUAL VM after install:
+# python -c "import torch; print(torch.cuda.is_available())"   # must print True
+# If False, adjust the torch version below to the newest cu121 build the
+# M60 driver accepts (the grader replicates this file before grading).
+
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.2.2
+numpy>=1.24,<2
+sentence-transformers==3.1.1
 faiss-cpu>=1.7.4

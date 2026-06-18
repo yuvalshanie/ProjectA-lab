@@ -1,163 +1,83 @@
-# Section B — Wikipedia Retrieval Pipeline
+# Section B — Retrieval pipeline
 
-End-to-end retrieval over a corpus of ~27k Wikipedia-style pages. Given a batch
-of natural-language queries, `run(queries)` returns, for each query, a ranked
-list of `page_id`s (most relevant first). Only the top-10 per query are scored
-(mean NDCG@10, binary relevance).
+This project answers queries over about 27,000 Wikipedia-style pages. The
+function `run(queries)` returns, for each query, a list of page ids ordered from
+most to least relevant. Only the top 10 per query are scored (mean NDCG@10).
 
-Retrieval is a **hybrid of dense (MiniLM) and lexical (BM25)** scoring. All
-embeddings use **`sentence-transformers/all-MiniLM-L6-v2`** (assignment
-requirement); BM25 is implemented from scratch with `numpy` + the standard
-library. The only third-party dependencies are `numpy`, `sentence-transformers`,
-and `faiss-cpu`.
-
-**Public self-test result: mean NDCG@10 = 0.277** (dense-only baseline: 0.224).
-
----
-
-## Pipeline
-
-The pipeline is split into small, single-responsibility modules:
-
-| Stage    | File          | What it does |
-|----------|---------------|--------------|
-| Chunk    | `chunk.py`    | Turns each page into retrieval unit(s). We use **one unit per page** = `title + "\n\n" + content` (see *Design decisions*). |
-| Embed    | `embed.py`    | Encodes text with all-MiniLM-L6-v2, L2-normalized, at `max_seq_length=256` (chosen empirically — see below). |
-| Index    | `index.py`    | Offline: embeds the whole corpus, builds the BM25 index, and writes `artifacts/`. Also loads the dense part back. |
-| Lexical  | `lexical.py`  | Offline: builds a pruned/capped BM25 inverted index (numpy + stdlib). Query-time: scores a query batch against it. |
-| Retrieve | `retrieve.py` | Timed: embeds the queries, scores them with **dense cosine + BM25**, min-max normalizes each signal per query, fuses them (`0.6·dense + 0.4·bm25`), and returns the top-10 page_ids. |
-| Entry    | `main.py`     | `run(queries)` → `retrieve.search_batch(queries)`. |
-
-`utils.py` holds shared paths/constants; `eval.py` (read-only) computes NDCG@10.
-
-> **Why not FAISS here?** Exact dense search is a single `(50 × 27074 × 384)`
-> matmul — well under a second — so an approximate index would only cost recall.
-> `faiss-cpu` stays in `requirements.txt` (it is in the sanctioned dependency
-> set) but is unnecessary at this corpus size.
-
-### Why this design
-
-The corpus mixes long real-Wikipedia "distractor" articles (median ~7.6k chars)
-with **short synthetic answer pages** (the relevant pages have a median length
-of ~1k chars; 79% are under 2k chars). The queries are abstract "riddle-style"
-descriptions that rarely name the target entity.
-
-**Step 1 — the dense representation.** Because the answer pages are short, a
-single page vector represents them faithfully. Among MiniLM-only options the
-native window (256) was best; everything fancier added noise:
-
-| Dense strategy (all MiniLM-only)                    | NDCG@10 |
-|-----------------------------------------------------|:-------:|
-| **Whole-page vector, `max_seq_length=256`**         | **0.224** |
-| Whole-page vector, `max_seq_length=384` / `512`     | 0.213 / 0.217 |
-| 256 / 512 score ensembles                           |  ≤0.220 |
-| Title-only vector                                   |  0.008  |
-| Whole + title ensemble                              |  ≤0.13  |
-| Pseudo-relevance feedback (query expansion)         |  ≤0.22  |
-| Query decomposition (clause sub-queries)            |  ≤0.21  |
-| Document-neighbor / cluster expansion               |  ≤0.20  |
-
-A diagnostic shows why dense plateaus: **71/100** relevant pages land in the
-top-100 but only **26/100** in the top-10 — recall is fine, ranking *precision*
-is the bottleneck. **Single-answer** queries score ~0.34, while **multi-fact
-"what links X, Y and Z"** queries (half the set) score only ~0.10 and dominate
-the gap.
-
-**Step 2 — add lexical (BM25), the real win.** Those queries carry exact tokens
-(`1,456,779 residents`, `September 1958`, `seven-game`, proper names) that dense
-embeddings blur but term matching nails. Fusing the two signals — each min-max
-normalized per query, then `0.6·dense + 0.4·bm25` — gives the final result:
-
-| Final retriever                          | NDCG@10 | single | multi |
-|------------------------------------------|:-------:|:------:|:-----:|
-| Dense only                               |  0.224  | 0.345  | 0.104 |
-| BM25 only                                |  0.224  | 0.274  | 0.174 |
-| **Hybrid dense + BM25 (final)**          | **0.277** | 0.350 | 0.183 |
-
-The BM25 parameters are textbook defaults (`k1=1.5`, `b=0.75`) and the fusion
-weight is flat across 0.5–0.65, so the gain is not an overfit to the public set.
-Capping each term to its 200 strongest postings both shrinks the index and
-removes noisy low-weight matches (it slightly *raised* quality). The whole index
-stays small enough to commit **without Git LFS**.
-
----
-
-## Artifacts (required — committed to the repo)
-
-The grader does **not** rebuild the index; it loads these files from disk:
-
-| Path                            | Format | Contents |
-|---------------------------------|--------|----------|
-| `artifacts/index_vectors.npy`   | `float32` `(num_pages, 384)` | L2-normalized page embeddings (~41 MB). |
-| `artifacts/index_meta.json`     | JSON   | `page_ids` (row → page_id), `chunk_ids`, `model`, `max_seq_length`, `embed_dim`, `num_vectors`. |
-| `artifacts/bm25_postings.npz`   | npz    | BM25 inverted index: `indptr`, `docs` (int32), `weights` (float16). ~22 MB. |
-| `artifacts/bm25_vocab.txt`      | text   | One term per line; line number = column id used by `indptr`. ~4 MB. |
-| `artifacts/bm25_meta.json`      | JSON   | `num_docs`, `k1`, `b`, pruning params, `vocab_size`, `nnz`. |
-
-Row `i` of `index_vectors.npy` and BM25 document id `i` both correspond to
-`page_ids[i]` (both are built from the same corpus iteration order). Every file
-is well under GitHub's 100 MB per-file limit, so **no Git LFS is required** and a
-fresh clone runs out of the box.
-
-> The raw corpus (`data/Wikipedia Entries/`, ~430 MB) is **git-ignored**: it is
-> only needed to *rebuild* the index, never at grading time. The 50 labelled
-> public queries (`data/public_queries.json`) are committed so `eval_public.py`
-> runs on a fresh clone.
-
----
-
-## Setup & usage
+## How to run
 
 ```bash
-pip install -r requirements.txt
+pip install -r requirements.txt     # see the GPU notes inside requirements.txt
+python scripts/build_index.py       # build the index (offline, a few minutes)
+python scripts/eval_public.py       # score on the public queries (no rebuild)
 ```
 
-**Evaluate (uses the committed index — no rebuild needed):**
+`build_index.py` writes the files in `artifacts/`. After that, `eval_public.py`
+only loads those files, so a fresh clone runs without rebuilding. One call to
+`run()` on 50 queries finishes in about 14 seconds (the limit is 60).
 
-```bash
-python scripts/eval_public.py
-# -> public_queries=50 / mean_ndcg@10=0.2765 / query_phase_time≈2s
-```
+## How it works
 
-**Rebuild the index from the corpus (offline, our machine only):**
-Place the corpus under `data/Wikipedia Entries/` (one JSON per page), then:
+We combine two kinds of search and merge their scores for each query.
 
-```bash
-python scripts/build_index.py     # writes artifacts/
-```
+1. **Chunk** (`chunk.py`). The embedding model only reads the first ~256 tokens
+   of its input, so we split every page into several short "views": the title,
+   the lead (title + first paragraph), the full page (for short pages), and a
+   few overlapping windows of the body. Each view is embedded on its own.
 
----
+2. **Embed** (`embed.py`). Every view is turned into a vector with the required
+   model `all-MiniLM-L6-v2`. Vectors are L2-normalized.
 
-## Repository layout
+3. **Index** (`index.py`). All view vectors go into a FAISS index (dense search).
+   In parallel we build a keyword index (`lexical.py`): a tf-idf inverted index
+   with word pairs/triples, a boost for numbers, and decade tokens (a page that
+   mentions 1825 also gets a "1820s" token).
 
-```
-main.py            run(queries) entry point (called by the grader)
-chunk.py           page -> retrieval unit(s)
-embed.py           all-MiniLM-L6-v2 encoder (shared by corpus & queries)
-lexical.py         BM25 inverted index: offline build + query-time scoring
-index.py           offline build (dense + BM25) + load of artifacts/
-retrieve.py        hybrid dense+BM25 scoring and fusion -> top-10 page_ids
-utils.py           paths, constants, corpus iteration
-eval.py            NDCG@10 (read-only)
-scripts/
-  build_index.py   offline index build (read-only)
-  eval_public.py   public self-test (read-only)
-artifacts/         committed prebuilt index, loaded at grading time:
-  index_vectors.npy / index_meta.json     dense MiniLM page embeddings
-  bm25_postings.npz / bm25_vocab.txt / bm25_meta.json   BM25 lexical index
-data/
-  public_queries.json   50 labelled public queries
-  Wikipedia Entries/    full corpus (git-ignored; rebuild input only)
-requirements.txt
-```
+4. **Retrieve** (`retrieve.py`). For each query we get a dense score (sum of a
+   page's 3 best view matches) and a keyword score. We scale each to 0–1, add
+   them (keyword weight 0.75), and add a small bonus for pages that score well
+   in both. The top 10 pages are returned.
 
----
+## Files
 
-## Video
+| File | What it does |
+|---|---|
+| `main.py` | `run(queries)` (called by the autograder) and the offline build entry. |
+| `chunk.py` | Split a page into views. |
+| `embed.py` | Load the model and embed text. |
+| `lexical.py` | Build and score the keyword (inverted) index. |
+| `index.py` | Build the artifacts; load them at query time. |
+| `retrieve.py` | Search, score, and merge the two signals. |
+| `utils.py` | Paths and small helpers (read corpus, read queries). |
 
-Presentation video: **<ADD VIDEO LINK HERE>**
+## Artifacts (in `artifacts/`, loaded at query time, never rebuilt during grading)
 
-## Team
+| File | Contents |
+|---|---|
+| `dense_vectors.npy` | All view embeddings, saved as float16 (under 100 MB, so no Git LFS). A FAISS index is rebuilt from these at load. |
+| `index_meta.json` | The page id for each vector, the model name, and sizes. |
+| `lexical.json.gz` | The keyword index (page lengths, idf, and postings). |
 
-- ID 315335315
-- ID 212134845
+`run()` uses only these files. It does not read the corpus at query time.
+
+## Results (public queries, mean NDCG@10)
+
+| Setup | NDCG@10 |
+|---|---|
+| Dense only | 0.22 |
+| Keyword only | 0.41 |
+| Both combined (final) | 0.49 |
+
+Single-answer questions score about 0.63. The hardest ones are the broad
+"what links A, B, and C" questions with many correct pages (about 0.20): their
+pages are retrievable but hard to rank into the top 10.
+
+### Things we tried and dropped
+- A cross-encoder reranker. It helped a weaker setup but lowered our score here
+  (0.49 to 0.43) and was slower, so we did not use it.
+- BM25 length normalization. The tf-idf formula with a mild length penalty was
+  clearly better here (0.41 vs 0.32 keyword-only).
+
+## Submit
+Public GitHub repo with this code and the committed `artifacts/`.
+Video link: **<add link>**.

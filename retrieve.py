@@ -1,75 +1,69 @@
-"""Query-time retrieval (the timed stage at grading).
+"""Query-time retrieval. This is the timed part the autograder runs.
 
-Hybrid of two signals, each scored over the whole corpus and min-max normalized
-per query, then linearly fused:
+For each query we combine two scores:
+1. Dense score: embed the query with MiniLM, search the FAISS index of page
+views, and give each page the sum of its 3 best view matches.
+2. Lexical score: keyword matching from the inverted index (see lexical.py).
 
-    score = ALPHA_DENSE * dense_cosine + (1 - ALPHA_DENSE) * bm25
+We put both scores on a 0-1 scale (divide by the per query maximum), add them,
+and give a small extra bonus to pages that score well in both. The best 10
+pages are returned.
 
-* dense  — cosine similarity between the query and page embeddings
-           (all-MiniLM-L6-v2, L2-normalized -> inner product). Exact search by a
-           dense matmul; at 27k x 384 this is well under a second, so an ANN
-           index (FAISS) is unnecessary here and we keep exact recall.
-* bm25   — lexical overlap from the prebuilt inverted index (see ``lexical.py``),
-           which captures the exact years / populations / scores / names that
-           dense embeddings blur.
-
-There is one vector per page, so each corpus row maps directly to a page_id and
-no chunk aggregation is needed.
+We also tried a cross encoder reranker on top. It did not improve the score here
+and was slower, so the final pipeline uses only these two signals.
 """
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 
 from embed import embed_queries
 from index import load_index
 from lexical import LexicalIndex
-from utils import ALPHA_DENSE, K_EVAL
+from utils import K_EVAL
+
+DENSE_DEPTH = 2000          # how many view vectors to pull from FAISS per query
+# A page's dense score is the sum of its 3 best view matches. We use 3 because a
+# page usually matches well on its title/lead/full views; adding more matches
+# only brings in noise from body chunks. The exact weights are not sensitive.
+HIT_WEIGHTS = (1.0, 0.5, 0.3)
+LEXICAL_WEIGHT = 0.75       # how much the keyword score counts in the sum
+CONSENSUS_BONUS = 0.7       # extra reward for pages that score well in both
+
+_CACHE: Optional[Tuple["object", Dict, LexicalIndex]] = None
 
 
-def _minmax_rows(scores: np.ndarray) -> np.ndarray:
-    """Min-max normalize each row to [0, 1] (constant rows -> 0)."""
-    lo = scores.min(axis=1, keepdims=True)
-    hi = scores.max(axis=1, keepdims=True)
-    return (scores - lo) / (hi - lo + 1e-9)
+def _get_index(artifacts_dir: Optional[Path]):
+    global _CACHE
+    if _CACHE is None:
+        _CACHE = load_index(artifacts_dir)
+    return _CACHE
 
 
-class Retriever:
-    """Holds the dense vectors, page_id map, and the BM25 index (built once)."""
-
-    def __init__(self, artifacts_dir: Optional[Path] = None) -> None:
-        vectors, page_ids = load_index(artifacts_dir)
-        self.vectors = np.ascontiguousarray(vectors, dtype=np.float32)
-        self.page_ids = page_ids
-        self.lexical = LexicalIndex(artifacts_dir)
-        if self.lexical.num_docs != len(page_ids):
-            raise ValueError(
-                "Dense/lexical index mismatch: "
-                f"{len(page_ids)} pages vs {self.lexical.num_docs} lexical docs"
-            )
-
-    def search(self, queries: List[str], top_k: int = K_EVAL) -> List[List[int]]:
-        if not queries:
-            return []
-        if self.vectors.shape[0] == 0:
-            return [[] for _ in queries]
-
-        query_vectors = embed_queries(queries)
-        dense = query_vectors @ self.vectors.T          # (Q, n_pages)
-        bm25 = self.lexical.scores(queries)             # (Q, n_pages)
-        fused = ALPHA_DENSE * _minmax_rows(dense) + (1.0 - ALPHA_DENSE) * _minmax_rows(bm25)
-
-        results: List[List[int]] = []
-        for row in fused:
-            top = np.argpartition(-row, min(top_k, row.size - 1))[:top_k]
-            top = top[np.argsort(-row[top])]
-            results.append([int(self.page_ids[i]) for i in top])
-        return results
+def _dense_page_scores(
+    sims: np.ndarray, idxs: np.ndarray, page_ids: List[int]
+) -> Dict[int, float]:
+    #Turn view matches into one score per page (sum of a page's best hits).
+    hits: Dict[int, List[float]] = {}
+    for sim, vi in zip(sims.tolist(), idxs.tolist()):
+        if vi < 0:
+            continue
+        hits.setdefault(page_ids[vi], []).append(float(sim))
+    scores: Dict[int, float] = {}
+    for pid, values in hits.items():
+        values.sort(reverse=True)
+        scores[pid] = sum(w * values[i] for i, w in enumerate(HIT_WEIGHTS) if i < len(values))
+    return scores
 
 
-_retriever: Retriever | None = None
+def _bymax(scores: Dict[int, float]) -> Dict[int, float]:
+    #Scale scores to 0-1 by dividing by the highest score for this query.
+    if not scores:
+        return {}
+    hi = max(scores.values()) or 1.0
+    return {pid: s / hi for pid, s in scores.items()}
 
 
 def search_batch(
@@ -78,8 +72,25 @@ def search_batch(
     top_k: int = K_EVAL,
     artifacts_dir: Optional[Path] = None,
 ) -> List[List[int]]:
-    """Return ranked page_id lists (best first) for each query."""
-    global _retriever
-    if _retriever is None or artifacts_dir is not None:
-        _retriever = Retriever(artifacts_dir)
-    return _retriever.search(queries, top_k=top_k)
+    index, meta, lexical = _get_index(artifacts_dir)
+    page_ids = meta["page_ids"]
+
+    qvecs = embed_queries(queries)
+    if qvecs.size == 0:
+        return [[] for _ in queries]
+    qvecs = np.ascontiguousarray(qvecs.astype(np.float32, copy=False))
+    depth = min(DENSE_DEPTH, index.ntotal)
+    sims, idxs = index.search(qvecs, depth)
+
+    results: List[List[int]] = []
+    for q, row_sim, row_idx in zip(queries, sims, idxs):
+        dense = _bymax(_dense_page_scores(row_sim, row_idx, page_ids))
+        sparse = _bymax(lexical.score(q))
+        fused: Dict[int, float] = {}
+        for pid in set(dense) | set(sparse):
+            d, s = dense.get(pid, 0.0), sparse.get(pid, 0.0)
+            # add the two scores, plus a bonus when both are high (d*s is only
+            # large if neither score is near zero).
+            fused[pid] = d + LEXICAL_WEIGHT * s + CONSENSUS_BONUS * (d * s) ** 0.5
+        results.append(sorted(fused, key=fused.get, reverse=True)[:top_k])
+    return results
