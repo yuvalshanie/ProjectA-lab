@@ -26,7 +26,7 @@ We combine two kinds of search and merge their scores for each query.
    few overlapping windows of the body. Each view is embedded on its own.
 
 2. **Embed** ('embed.py'). Every view is turned into a vector with the required
-   model 'all-MiniLM-L6-v2'. Vectors are L2-normalized.
+   model 'all-MiniLM-L6-v2'. The vectors are L2-normalized.
 
 3. **Index** ('index.py'). All view vectors go into a FAISS index (dense search).
    In parallel we build a keyword index ('lexical.py'): a tf-idf inverted index
@@ -77,6 +77,7 @@ pages are retrievable but hard to rank into the top 10.
   (0.49 to 0.43) and was slower, so we did not use it.
 - BM25 length normalization. The tf-idf formula with a mild length penalty was
   clearly better here (0.41 vs 0.32 keyword-only).
+
 
 ## Submit
 Public GitHub repo with this code and the committed 'artifacts/'.
