@@ -80,4 +80,5 @@ pages are retrievable but hard to rank into the top 10.
 
 ## Submit
 Public GitHub repo with this code and the committed `artifacts/`.
-Video link: **<add link>**.
+Video link: https://github.com/yuvalshanie/ProjectA-lab/blob/main/presentation.mp4
+
