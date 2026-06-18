@@ -8,6 +8,7 @@ vectors per page:
 - full:   the whole page (only for short pages)
 - chunks: overlapping windows over the body
 
+
 This way a query can match a page through any of these pieces. This is the
 chunking idea from Lecture 3.
 """
